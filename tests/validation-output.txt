@@ -1,0 +1,22 @@
+ShopDock Local v0.3.0 — 2026-11-02
+
+Docker isolated full-suite, network disabled, temporary APP_DATA:
+entrypoint=/opt/mpau-venv/bin/python
+PYTHONPATH=/work/.testdeps:/work:/usr/local/lib/python3.12/site-packages
+python -m pytest tests -q -p no:cacheprovider
+136 passed, 1 warning in 27.66s
+Warning: existing FastAPI/Starlette httpx deprecation.
+Playwright: 1.64.1
+Browser tests: actual Chrome with local mock HTML; no merchant writes.
+
+node --check app/static/app.js
+exit 0
+node --test tests/test_ui.cjs
+3 tests, 3 pass, 0 fail, 0 skipped
+
+Docker compose config --quiet (full/core): exit 0
+Actual Edge UI inspection on temporary 127.0.0.1:8081: passed, no console errors.
+Temporary UI container removed. Existing 8080 service untouched.
+
+Not verified: real merchant DOM rules, actual accounts, actual product/inventory/order operations,
+real video publish, full Docker image rebuild.

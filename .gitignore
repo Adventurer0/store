@@ -1,0 +1,13 @@
+data/
+.env
+.venv/
+.deps/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.zip
+*.tar.gz
+.testdeps/
+.test-data/
+node_modules/
+.npm-cache/

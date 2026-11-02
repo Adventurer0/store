@@ -1,0 +1,15 @@
+.git
+.env
+.deps
+.venv
+data
+__pycache__
+.pytest_cache
+tests
+*.zip
+*.tar.gz
+*.png
+.testdeps
+.test-data
+node_modules
+.npm-cache

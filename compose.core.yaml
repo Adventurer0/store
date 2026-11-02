@@ -1,0 +1,22 @@
+name: shopdock
+services:
+  shopdock:
+    build:
+      context: .
+      target: core
+    image: shopdock:core
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+    environment:
+      APP_DATA: /data
+      TZ: Asia/Shanghai
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-1024}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    volumes:
+      - shopdock-data:/data
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  shopdock-data:

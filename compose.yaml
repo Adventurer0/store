@@ -1,0 +1,27 @@
+name: shopdock
+services:
+  shopdock:
+    build:
+      context: .
+      target: full
+    image: shopdock:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+    environment:
+      APP_DATA: /data
+      TZ: Asia/Shanghai
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-1024}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      COMMERCE_BROWSER_CHANNEL: ${COMMERCE_BROWSER_CHANNEL:-chrome}
+      COMMERCE_HEADLESS: "0"
+    volumes:
+      - shopdock-data:/data
+    shm_size: "1gb"
+    stop_grace_period: 35s
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  shopdock-data:
