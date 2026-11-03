@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import httpx
 from . import db
+from .commerce_profiles import login_url
 from .security import redact
 
 PLATFORMS = {
@@ -43,6 +44,7 @@ _VIDEO_PORTALS = {
 }
 for _platform, _meta in PLATFORMS.items():
     _meta.update(portal=_COMMERCE_PORTALS[_platform],
+                 login_portal=login_url(_platform),
                  video_portal=_VIDEO_PORTALS[_platform],
                  commerce_mode='browser_cookie',
                  commerce=['product_create', 'product_update', 'product_list',

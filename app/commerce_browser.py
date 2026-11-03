@@ -14,9 +14,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from . import db
 from .connectors import Blocked, Rejected, Uncertain
 from .commerce_profiles import PROFILES, trusted_url
+from .platform_feedback import translate
 
 
 ACTIONS = {'product_create', 'product_update', 'product_list', 'product_delist', 'orders', 'fetch_skus', 'inventory_sync'}
@@ -110,6 +112,21 @@ def check_session(store):
         raise Blocked('请先完成此店铺的电商后台网页登录和登录检查；视频账号登录不能代替电商登录')
     if not available():
         raise Blocked('商家浏览器未安装；请使用 Docker 完整镜像或安装 Playwright 和 Chrome')
+
+
+def confirm_login(store_id):
+    """Ask the running login worker to stop after verifying the page.
+
+    The worker has no database access, so the confirmation is a short-lived
+    marker inside that store's isolated browser profile.
+    """
+    path = profile_path(store_id, create=True)
+    marker = path / 'login.confirm'
+    if marker.is_symlink():
+        raise Blocked('登录确认标记不能是符号链接')
+    marker.write_text(str(int(time.time())), encoding='utf-8')
+    marker.chmod(0o600)
+    return marker
 
 
 def _config(store):
@@ -216,6 +233,31 @@ def product_payload(store, product, listing, action):
     return {'product': safe_product, 'listing': listing, 'publish_config': config}
 
 
+def prepare_payload(store, product, listing, upload_images=False, business=None):
+    """Review a built-in Kuaishou form preview, without a user DOM workflow."""
+    check_session(store)
+    if store['platform'] != 'kuaishou':
+        raise Blocked('填表预览当前仅支持快手小店')
+    identity = _config(store).get('identity')
+    if not isinstance(identity, dict) or not identity.get('target') or not isinstance(identity.get('value'), str) or not identity['value'].strip():
+        raise Blocked('请先核对并绑定当前快手店铺身份')
+    if listing.get('external_id'):
+        raise Blocked('已有平台商品不能作为新建商品填表预览')
+    defaults = store.get('templates', {}).get('publish_defaults', {})
+    if not isinstance(defaults, dict) or not isinstance(defaults.get('kuaishou_preview', {}), dict):
+        raise Blocked('快手商品业务默认资料格式错误')
+    approved = copy.deepcopy(defaults.get('kuaishou_preview', {}))
+    if business:
+        approved.update(business)
+    safe_product = copy.deepcopy(product)
+    for sku in safe_product['skus']:
+        sku['stock'] = 0
+        sku['price'] = format(sku['price_cents'] / 100, '.2f')
+    return {'product': safe_product, 'listing': copy.deepcopy(listing),
+            'publish_config': {'kuaishou_preview': approved},
+            'upload_images': bool(upload_images)}
+
+
 class CommerceBrowser:
     def __init__(self, store):
         self.store = store
@@ -227,7 +269,7 @@ class CommerceBrowser:
         with db.connection() as c:
             c.execute('UPDATE stores SET commerce_status=? WHERE id=?', (value, self.store['id']))
 
-    def _run(self, action, payload=None):
+    def _run(self, action, payload=None, job_id=''):
         interpreter = browser_python()
         if not interpreter:
             raise Blocked('商家浏览器未安装；请使用 Docker 完整镜像或安装 Playwright 和 Chrome')
@@ -239,6 +281,14 @@ class CommerceBrowser:
         mids = product.get('image_ids', []) + product.get('detail_image_ids', [])
         if product.get('cover_id'):
             mids += [product['cover_id']]
+        if action == 'collect_requirements' or (action in ('prepare_product', 'prepare_workbench', 'submit_workbench') and not (payload or {}).get('upload_images')):
+            mids = []
+        elif action in ('prepare_workbench', 'submit_workbench'):
+            for field in (payload or {}).get('schema', {}).get('fields', []):
+                if field.get('type') == 'images':
+                    values = (payload or {}).get('values', {}).get(field.get('key'), [])
+                    if isinstance(values, list):
+                        mids += values
         for mid in set(mids):
             row = db.one("SELECT * FROM media WHERE id=? AND kind='image'", (mid,))
             if not row:
@@ -249,21 +299,26 @@ class CommerceBrowser:
             media[mid] = str(target)
         request = {'platform': self.platform, 'profile': str(path), 'action': action,
                    'config': config, 'payload': payload or {}, 'media': media}
-        timeout = 660 if action == 'login' else 600
+        if action == 'prepare_product':
+            from .commerce_preview import paths
+            paths(db.DATA, job_id, create=True)
+            request['preview'] = {'job_id': job_id, 'seconds': 600}
+        timeout = 900 if action == 'prepare_product' else 360 if action == 'login' else 600
         try:
             completed = run_worker([interpreter, str(Path(__file__).with_name('commerce_worker.py'))],
                                        input=db.dumps(request), text=True, encoding='utf-8',
                                        capture_output=True, timeout=timeout, check=False,
                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except subprocess.TimeoutExpired:
-            raise (Uncertain if action in ACTIONS and action not in ('orders', 'fetch_skus') else Blocked)('网页操作超时，请核对商家后台后再决定是否重试') from None
+            # A unified submit may have clicked the platform button already.
+            raise (Uncertain if action == 'submit_workbench' or (action in ACTIONS and action not in ('orders', 'fetch_skus')) else Blocked)('网页操作超时，请核对商家后台后再决定是否重试') from None
         except OSError:
             raise Blocked('商家浏览器进程无法启动，请检查 Playwright 安装') from None
         try:
             response = json.loads(completed.stdout)
         except (ValueError, TypeError):
             # Browser stderr may contain URLs or tokens and must never reach logs/UI.
-            raise (Uncertain if action in ACTIONS and action not in ('orders', 'fetch_skus') else Blocked)('商家浏览器异常退出，请核对后台实际结果') from None
+            raise (Uncertain if action == 'submit_workbench' or (action in ACTIONS and action not in ('orders', 'fetch_skus')) else Blocked)('商家浏览器异常退出，请核对后台实际结果') from None
         if not isinstance(response, dict) or completed.returncode != 0:
             raise Uncertain('商家浏览器进程未正常完成，请核对后台实际结果')
         error = response.get('error')
@@ -272,8 +327,13 @@ class CommerceBrowser:
             if kind == 'session' or error.get('session_expired'):
                 self._status('expired')
             exc = {'blocked': Blocked, 'session': Blocked, 'rejected': Rejected}.get(kind, Uncertain)
-            # Worker errors use fixed messages, never page text or exception details.
-            raise exc(error.get('message', '网页操作未能确认，请核对后台'))
+            code = str(error.get('code') or '')[:40]
+            message = error.get('message', '网页操作未能确认，请核对后台')
+            if code:
+                message, code = translate(self.platform, code, message)
+            failure = exc(message)
+            failure.code = code
+            raise failure
         return response.get('result', {})
 
     def account(self, action, job_id=''):
@@ -307,6 +367,53 @@ class CommerceBrowser:
             raise Blocked('未知商品操作')
         with profile_lock(self.store['id']):
             return self._run(action, payload)
+
+    def prepare_product(self, payload, job_id):
+        check_session(self.store)
+        if self.platform != 'kuaishou':
+            raise Blocked('填表预览当前仅支持快手小店')
+        with profile_lock(self.store['id']):
+            return self._run('prepare_product', payload, job_id=job_id)
+
+    def collect_requirements(self, payload):
+        check_session(self.store)
+        with profile_lock(self.store['id']):
+            return self._run('collect_requirements', payload)
+
+    def prepare_workbench(self, payload):
+        check_session(self.store)
+        reviewed = copy.deepcopy(payload)
+        reviewed['business_defaults'] = self.store.get('templates', {}).get('publish_defaults', {}).get('kuaishou_preview', {})
+        with profile_lock(self.store['id']):
+            return self._run('prepare_workbench', reviewed)
+
+    def submit_workbench(self, payload):
+        check_session(self.store)
+        reviewed = copy.deepcopy(payload)
+        action = 'product_update' if reviewed.get('mode') == 'update' else 'product_create'
+        workflows = _config(self.store).get('workflows', {})
+        if not isinstance(workflows, dict):
+            raise Blocked('commerce_browser.workflows 必须是 JSON 对象')
+        workflow = workflows.get(action)
+        result = workflow.get('result') if isinstance(workflow, dict) else None
+        if isinstance(result, dict) and result.get('external_id'):
+            validate_workflow(self.store, action)
+            defaults = self.store.get('templates', {}).get('publish_defaults', {})
+            listing_config = reviewed.get('listing', {}).get('publish_config', {})
+            if isinstance(listing_config, str):
+                listing_config = json.loads(listing_config)
+            if not isinstance(defaults, dict) or not isinstance(listing_config, dict):
+                raise Blocked('商品与店铺发布配置必须是 JSON 对象')
+            reviewed['publish_config'] = {**defaults, **listing_config}
+        reviewed['business_defaults'] = self.store.get('templates', {}).get('publish_defaults', {}).get('kuaishou_preview', {})
+        reviewed['upload_images'] = True
+        with profile_lock(self.store['id']):
+            return self._run('submit_workbench', reviewed)
+
+    def audit_workbench(self, payload):
+        check_session(self.store)
+        with profile_lock(self.store['id']):
+            return self._run('audit_product', payload)
 
     def orders(self, start, end):
         check_session(self.store)

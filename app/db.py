@@ -122,6 +122,10 @@ def init():
           token TEXT PRIMARY KEY, media_id TEXT NOT NULL REFERENCES media(id), expires INTEGER NOT NULL);
         UPDATE settings SET value='3' WHERE key='schema_version';
         ''')
+        from .media_library import init_schema as init_media_library_schema
+        init_media_library_schema(c)
+        from .publish_workbench import init as init_publishing
+        init_publishing(c)
 
 
 def one(sql, args=()):

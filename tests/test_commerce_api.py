@@ -13,10 +13,24 @@ def test_legacy_api_flag_cannot_reenable_merchant_api(owner):
     assert owner.put('/api/stores/' + store['id'], json=data).json()['api_enabled'] == 0
 
 
+def test_upgrades_revalidate_html_and_load_versioned_assets(client):
+    import re
+    page = client.get('/')
+    assert page.headers['cache-control'] == 'no-cache'
+    scripts = re.findall(r'<script src="([^"]+)"', page.text)
+    styles = re.findall(r'<link rel="stylesheet" href="([^"]+)"', page.text)
+    assert len(scripts) == 3 and len(styles) == 3
+    for url in scripts + styles:
+        assert url.endswith('?v=0.3.7')
+        response = client.get(url)
+        assert response.status_code == 200
+        assert response.headers['cache-control'] == 'no-cache'
+
+
 def test_state_reports_distinct_sessions_and_no_cookie_data(owner, store):
     state = owner.get('/api/state').json()
     assert isinstance(state['commerce_browser_ready'], bool)
-    assert state['version'] == '0.3.0'
+    assert state['version'] == '0.3.7'
     assert state['platforms']['tmall']['portal'] != state['platforms']['tmall']['video_portal']
     for platform in state['platforms'].values():
         assert platform['commerce_mode'] == 'browser_cookie'
@@ -58,3 +72,19 @@ def test_csv_cannot_replace_browser_order_and_reconcile_keeps_source(owner, stor
     saved = db.one('SELECT * FROM orders')
     assert saved['source'] == 'browser'
     assert json.loads(saved['data'])['status'] == '待发货'
+
+
+def test_login_confirmation_requires_an_active_login_job(owner, store):
+    path = '/api/stores/' + store['id'] + '/commerce/login/confirm'
+    assert owner.post(path, json={}).status_code == 409
+    now = int(__import__('time').time())
+    with db.connection() as conn:
+        conn.execute('INSERT INTO jobs(id,batch_id,kind,store_id,entity_id,status,scheduled,payload,result,'
+                     'dedupe_key,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                     (db.uid(), db.uid(), 'commerce_login', store['id'], '', 'running', now,
+                      '{}', '{}', db.uid(), now, now))
+    response = owner.post(path, json={})
+    assert response.status_code == 200, response.text
+    marker = db.DATA / 'browser' / 'commerce' / store['id'] / 'login.confirm'
+    assert marker.is_file()
+    assert response.json()['ok'] is True

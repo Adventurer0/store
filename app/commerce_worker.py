@@ -12,17 +12,21 @@ from pathlib import Path
 import re
 import sys
 import time
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 try:
-    from .commerce_profiles import PROFILES, trusted_url
+    from .commerce_profiles import (PROFILES, READY_TEXTS, app_path, is_login_page,
+                                    login_url, trusted_url)
+    from .commerce_preview import paths as preview_paths, write_marker
 except ImportError:
-    from commerce_profiles import PROFILES, trusted_url
+    from commerce_profiles import (PROFILES, READY_TEXTS, app_path, is_login_page,
+                                   login_url, trusted_url)
+    from commerce_preview import paths as preview_paths, write_marker
 
 
 class Failure(Exception):
-    def __init__(self, kind, message):
+    def __init__(self, kind, message, code=''):
         self.kind, self.message = kind, message
+        self.code = str(code or '')[:40]
 
 
 PATTERN = re.compile(r'\{\{\s*([A-Za-z0-9_.]+)\s*\}\}')
@@ -172,8 +176,9 @@ class Runner:
 
     def logged_in(self):
         self.assert_origin()
-        path = urlsplit(self.page.url).path.lower()
-        if any(word in path for word in ('/login', '/signin', '/passport')):
+        # A sign-in host or /login path is never a completed session, even when
+        # the marketing shell around it renders a "登录" button.
+        if is_login_page(self.platform, self.page.url):
             return False
         if self.config.get('login_required'):
             if self.target(self.page, self.config['login_required']).first.is_visible():
@@ -183,9 +188,17 @@ class Runner:
             ready = self.target(self.page, probe)
             valid = ready.count() == 1 and ready.is_visible()
         else:
-            # Conservative semantic defaults; custom dashboards should set logged_in.
-            valid = any(self.page.get_by_text(name, exact=True).first.is_visible()
-                        for name in ('商品管理', '商品列表', '订单管理', '订单列表', '店铺管理'))
+            # Strong login-form text means the SPA is still asking for a scan or
+            # a code. This catches platforms that keep the same path after login.
+            login_texts = PROFILES[self.platform].get('login_texts', ())
+            if any(self.page.get_by_text(name, exact=False).first.is_visible()
+                   for name in login_texts):
+                return False
+            # A shop-selection or dashboard URL is enough: multi-shop accounts
+            # land on the chooser before any navigation item exists.
+            valid = app_path(self.platform, self.page.url) or any(
+                self.page.get_by_text(name, exact=True).first.is_visible()
+                for name in READY_TEXTS)
         if not valid:
             return False
         identity = self.config.get('identity')
@@ -194,26 +207,99 @@ class Runner:
         cookies = self.context.cookies([PROFILES[self.platform]['portal'], self.page.url])
         return any(c.get('value') and (c.get('expires', -1) == -1 or c.get('expires', 0) > time.time()) for c in cookies)
 
-    def assert_identity(self):
+    def assert_identity(self, page=None):
         identity = self.config.get('identity')
         if not identity or not identity.get('target') or not identity.get('value'):
             raise Failure('blocked', '网页写入必须配置并核对当前商家身份')
-        if self.read(self.page, identity['target']) != identity['value']:
+        # Receipt read-back can happen on a second, read-only product page.
+        if self.read(page or self.page, identity['target']) != identity['value']:
             raise Failure('session', '商家网页当前店铺与配置不一致，已停止写入')
 
+    def audit_product(self):
+        try:
+            from .platform_feedback import audit_detail
+        except ImportError:
+            from platform_feedback import audit_detail
+        external = str(self.payload.get('external_id') or '')
+        if not external:
+            raise Failure('blocked', '审核回查缺少平台商品 ID')
+        if self.platform == 'kuaishou':
+            try:
+                from .kuaishou_submission import EDIT_URL
+            except ImportError:
+                from kuaishou_submission import EDIT_URL
+            from urllib.parse import urlencode
+            url = EDIT_URL + '?' + urlencode({'itemId': external})
+        else:
+            configured = self.config.get('audit_url')
+            if not isinstance(configured, str) or '{external_id}' not in configured:
+                raise Failure('blocked', '未配置审核回查页面 audit_url（需包含 {external_id}），未猜测后台地址')
+            from urllib.parse import quote
+            url = configured.replace('{external_id}', quote(external, safe=''))
+        self.navigate(url)
+        self.assert_origin()
+        if is_login_page(self.platform, self.page.url):
+            raise Failure('session', '审核回查时登录已失效，请重新登录电商后台')
+        text = self.page.locator('body').inner_text()[:20000]
+        status, message, code = audit_detail(text)
+        if status == 'unknown':
+            raise Failure('blocked', '未能识别当前商品的审核状态，请核对商家后台', code=code)
+        return {'audit_status': status, 'audit_message': message, 'audit_code': code}
+
+    def _session_marker(self):
+        marker = self.profile / 'session.json'
+        if marker.is_symlink():
+            raise Failure('blocked', '商家登录状态文件不能是符号链接')
+        marker.write_text(json.dumps({'checked_at': int(time.time()), 'platform': self.platform}), encoding='utf-8')
+        marker.chmod(0o600)
+
+    def _session_message(self):
+        return ('电商后台网页登录检查通过，Cookie 已保存在本店独立浏览器目录'
+                if self.action == 'check' else '登录成功，浏览器窗口已自动关闭')
+
     def account(self):
-        self.navigate(PROFILES[self.platform]['portal'])
-        deadline = time.monotonic() + (600 if self.action == 'login' else 30)
+        login = login_url(self.platform)
+        # A probe page redirects to sign-in when the session is invalid, so it
+        # verifies an existing session instead of trusting a marketing page.
+        target = PROFILES[self.platform].get('probe', login) if self.action == 'check' else login
+        confirm = self.profile / 'login.confirm'
+        try:
+            confirm.unlink()
+        except FileNotFoundError:
+            pass
+        self.navigate(target)
+        # Give the SPA time to restore an existing session before we judge it.
+        self.page.wait_for_timeout(1500)
+        if self.logged_in():
+            self._session_marker()
+            return {'message': self._session_message()}
+        deadline = time.monotonic() + (300 if self.action == 'login' else 12)
         while time.monotonic() < deadline:
-            if self.logged_in():
-                marker = self.profile / 'session.json'
-                if marker.is_symlink():
-                    raise Failure('blocked', '商家登录状态文件不能是符号链接')
-                marker.write_text(json.dumps({'checked_at': int(time.time()), 'platform': self.platform}), encoding='utf-8')
-                marker.chmod(0o600)
-                return {'message': '电商后台网页登录检查通过，Cookie 已保存在本店独立浏览器目录'}
+            if confirm.exists():
+                try:
+                    confirm.unlink()
+                except FileNotFoundError:
+                    pass
+                if self.logged_in():
+                    self._session_marker()
+                    return {'message': '已确认登录完成，浏览器窗口已自动关闭'}
+                raise Failure('session', '页面仍停留在登录页，未检测到登录成功；请完成扫码后再点“我已完成登录”')
+            try:
+                if self.page.is_closed():
+                    raise Failure('session', '登录窗口已被关闭；请重新发起登录')
+                if self.logged_in():
+                    self._session_marker()
+                    return {'message': self._session_message()}
+            except Failure:
+                raise
+            except Exception:
+                # A redirect or SPA remount can detach the page briefly; retry.
+                if self.page.is_closed():
+                    raise Failure('session', '登录窗口已被关闭；请重新发起登录') from None
             self.page.wait_for_timeout(1000)
-        raise Failure('session', '电商后台登录尚未完成或已失效，请在扫码桌面完成登录后检查')
+        if self.action == 'check':
+            raise Failure('session', '未检测到有效登录；请重新登录电商后台，或完成扫码后再检查')
+        raise Failure('session', '未检测到登录成功，登录窗口已关闭；请重新发起登录并完成扫码')
 
     def prepare(self, steps, context):
         """Resolve every form variable before a browser action can submit anything."""
@@ -242,6 +328,15 @@ class Runner:
                 continue
             if step.get('commit') and success:
                 self.assert_identity()
+                if context.get('quality_gate'):
+                    try:
+                        from .commerce_forms import quality
+                    except ImportError:
+                        from commerce_forms import quality
+                    gate = context['quality_gate']
+                    score = quality(self.page, self.platform, gate['fingerprint'])
+                    if score.get('score') is None or score['score'] <= gate.get('minimum', 90):
+                        raise Failure('blocked', '点击提交前的平台真实商品分数未高于90分，已停止')
                 before = self.target(self.page, success, context)
                 if before.count() and before.first.is_visible():
                     raise Failure('uncertain' if self.write_started else 'blocked', '提交前已存在成功提示，无法识别新的提交回执；请调整 result.success')
@@ -411,6 +506,58 @@ class Runner:
             raise Failure('uncertain', '新商品提交后未确认全部 SKU 为零库存，请核对后台并暂停销售')
         return {'external_id': external, 'sku_map': mapping, 'message': '商家网页已提交并读取到成功回执；审核结果以平台后台为准'}
 
+    def prepare_product(self):
+        """Fill a Kuaishou form, then hand the visible browser to the merchant."""
+        try:
+            from .kuaishou_commerce import CREATE_URL, PrepareBlocked, prepare
+        except ImportError:
+            from kuaishou_commerce import CREATE_URL, PrepareBlocked, prepare
+        if self.platform != 'kuaishou':
+            raise Failure('blocked', '填表预览当前仅支持快手小店')
+        settings = self.request.get('preview', {})
+        try:
+            marker, stop = preview_paths(self.profile.parents[2], settings.get('job_id'), create=True)
+        except (ValueError, IndexError):
+            raise Failure('blocked', '填表预览任务标识或目录无效') from None
+        if stop.exists():
+            return {'message': '填表预览已结束；程序未点击提交审核', 'submitted_by_app': False}
+        self.navigate(PROFILES[self.platform]['portal'])
+        deadline = time.monotonic() + 20
+        while not self.logged_in():
+            if time.monotonic() > deadline:
+                raise Failure('session', '快手商家登录失效，请重新完成电商后台登录')
+            self.page.wait_for_timeout(500)
+        self.navigate(CREATE_URL)
+        config = copy.deepcopy(self.config)
+        config['business'] = self.payload.get('publish_config', {}).get('kuaishou_preview', {})
+        try:
+            result = prepare(self.page, self.payload, self.request.get('media', {}), config)
+        except PrepareBlocked as exc:
+            raise Failure('blocked', str(exc)) from None
+        needs_manual = [f"{item.get('label', '待核对项目')}：{item.get('reason', '请在页面核对')}"
+                        for item in result.get('missing', []) if isinstance(item, dict)]
+        progress = {'ready': True, 'active': True,
+                    'status': 'needs_input' if needs_manual else 'prepared',
+                    'filled': result.get('filled', []), 'needs_manual': needs_manual,
+                    'submitted_by_app': False, 'started_at': int(time.time()),
+                    'message': '快手填表预览已打开，最多保留 10 分钟。程序未点击提交审核或保存草稿；请核对页面和待补项目。'}
+        write_marker(marker, progress)
+        # No DOM writes, navigation, final-submit detection or listing updates
+        # happen during this handoff. Closing targets this job's own context.
+        seconds = min(600, max(0, int(settings.get('seconds', 600))))
+        deadline = time.monotonic() + seconds
+        try:
+            while time.monotonic() < deadline and not stop.exists() and not self.page.is_closed():
+                try:
+                    self.page.wait_for_timeout(1000)
+                except Exception:
+                    break
+        finally:
+            progress.update(active=False, status='closed', closed_at=int(time.time()),
+                            message='填表预览已结束。程序未点击提交审核或保存草稿；如你自行提交，请以平台后台结果为准。')
+            write_marker(marker, progress)
+        return progress
+
     def run(self):
         from playwright.sync_api import sync_playwright
         # Persistent Chromium profile contains HTTP-only Cookie and local storage.
@@ -418,7 +565,11 @@ class Runner:
         with sync_playwright() as playwright:
             kwargs = {'user_data_dir': str(self.profile), 'headless': os.environ.get('COMMERCE_HEADLESS') == '1',
                       'viewport': {'width': 1360, 'height': 860}, 'locale': 'zh-CN',
-                      'accept_downloads': False, 'args': ['--disable-dev-shm-usage']}
+                      'accept_downloads': False,
+                      'args': ['--disable-dev-shm-usage', '--no-first-run',
+                               '--no-default-browser-check', '--disable-translate',
+                               '--lang=zh-CN',
+                               '--disable-features=Translate,TranslateUI']}
             channel = os.environ.get('COMMERCE_BROWSER_CHANNEL', 'chrome')
             if channel and channel != 'chromium':
                 kwargs['channel'] = channel
@@ -426,9 +577,26 @@ class Runner:
             try:
                 self.context.set_default_timeout(15000)
                 self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-                return self.account() if self.action in ('login', 'check') else self.operate()
+                if self.action in ('login', 'check'):
+                    return self.account()
+                if self.action == 'prepare_product':
+                    return self.prepare_product()
+                if self.action == 'audit_product':
+                    return self.audit_product()
+                if self.action in ('collect_requirements', 'prepare_workbench', 'submit_workbench'):
+                    try:
+                        from .commerce_forms import run as run_workbench
+                    except ImportError:
+                        from commerce_forms import run as run_workbench
+                    return run_workbench(self, self.action)
+                return self.operate()
             finally:
-                self.context.close()
+                # A platform confirmation dialog must not turn a completed login
+                # into an error, and the window must close either way.
+                try:
+                    self.context.close()
+                except Exception:
+                    pass
 
 
 def main():
@@ -445,7 +613,9 @@ def main():
         kind = exc.kind
         if runner and runner.write_started:
             kind = 'uncertain'
-        response = {'error': {'kind': kind, 'message': exc.message, 'session_expired': exc.kind == 'session'}}
+        response = {'error': {'kind': kind, 'message': exc.message,
+                              'code': getattr(exc, 'code', ''),
+                              'session_expired': exc.kind == 'session'}}
     except ImportError:
         response = {'error': {'kind': 'blocked', 'message': '商家浏览器缺少 Playwright 运行依赖，请重新构建完整镜像'}}
     except Exception:

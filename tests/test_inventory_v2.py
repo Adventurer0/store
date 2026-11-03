@@ -182,3 +182,9 @@ def test_additive_migration_keeps_existing_product_and_listing(owner,product):
     row=db.one('SELECT * FROM listings')
     assert row['external_id']=='123' and row['sku_map']=='{}'
     assert db.one("SELECT value FROM settings WHERE key='schema_version'")['value']=='3'
+
+
+def test_polling_skips_a_store_without_an_orders_workflow(owner, store):
+    owner.put('/api/stores/'+store['id'],json={'name':'auto-no-rules','platform':'wechat','templates':{'auto_order_sync':True}})
+    jobs.Worker().schedule_order_sync()
+    assert db.one('SELECT count(*) n FROM jobs')['n'] == 0

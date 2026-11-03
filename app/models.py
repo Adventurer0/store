@@ -108,6 +108,66 @@ class Resolve(StrictModel):
     code: str = Field(pattern=r"^\d{6}$")
 
 
+class KuaishouPreviewBusiness(StrictModel):
+    category_path: list[Text] = Field(default_factory=list, max_length=8)
+    brand: str = Field(default='', max_length=100)
+    material: str = Field(default='', max_length=100)
+    closure: str = Field(default='', max_length=100)
+    freight_template: str = Field(default='', max_length=100)
+
+
+class CommercePrepareInput(StrictModel):
+    product_id: str = Field(pattern=r'^[a-f0-9]{32}$')
+    upload_images: bool = Field(default=False, strict=True)
+    business: KuaishouPreviewBusiness | None = None
+
+
+MediaId = Annotated[str, Field(pattern=r'^[a-f0-9]{32}$')]
+MediaTag = Annotated[str, Field(min_length=1, max_length=80)]
+
+
+class MediaMetadataPatch(StrictModel):
+    name: str | None = Field(default=None, min_length=1, max_length=240)
+    category: str | None = Field(default=None, max_length=100)
+    tags: list[MediaTag] | None = Field(default=None, max_length=30)
+
+    @model_validator(mode='after')
+    def valid_patch(self):
+        if not self.model_fields_set or any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError('请提供要更新的素材名称、分类或标签，字段不能为 null')
+        if self.name and any(ch in self.name for ch in ('/', '\\', '\x00', '\r', '\n')):
+            raise ValueError('素材名称不能包含路径或控制字符')
+        if self.tags is not None:
+            self.tags = list(dict.fromkeys(self.tags))
+        return self
+
+
+class MediaBatchMetadata(StrictModel):
+    ids: list[MediaId] = Field(min_length=1, max_length=200)
+    category: str | None = Field(default=None, max_length=100)
+    tags: list[MediaTag] | None = Field(default=None, max_length=30)
+
+    @model_validator(mode='after')
+    def valid_patch(self):
+        if not ({'category', 'tags'} & self.model_fields_set):
+            raise ValueError('请提供要更新的分类或标签')
+        if any(getattr(self, key) is None for key in self.model_fields_set - {'ids'}):
+            raise ValueError('素材分类或标签不能为 null')
+        self.ids = list(dict.fromkeys(self.ids))
+        if self.tags is not None:
+            self.tags = list(dict.fromkeys(self.tags))
+        return self
+
+
+class MediaBatchDelete(StrictModel):
+    ids: list[MediaId] = Field(min_length=1, max_length=200)
+
+    @field_validator('ids')
+    @classmethod
+    def unique_ids(cls, value):
+        return list(dict.fromkeys(value))
+
+
 class Allocation(StrictModel):
     version: int
     quantities: dict[str, dict[str, Annotated[int, Field(strict=True, ge=0, le=100_000_000)]]]

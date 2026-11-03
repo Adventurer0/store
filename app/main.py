@@ -11,15 +11,18 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, WebSocket
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import ValidationError
 from . import db, jobs, inventory
-from .models import Login, StoreInput, ProductInput, ListingInput, Batch, Note, JobAction, Resolve, Allocation, InventoryAdjustment
+from .models import Login, StoreInput, ProductInput, ListingInput, Batch, Note, JobAction, Resolve, Allocation, InventoryAdjustment, CommercePrepareInput
 from .security import require_user, session, encrypt, cipher, password_hash, check_password, token_hash, redact
 from .connectors import PLATFORMS, Blocked, mpau_available
 from .commerce_browser import available as commerce_browser_available
+from .publish_workbench_routes import router as publishing_router
+from .commerce_readiness import describe as describe_commerce_readiness
+from . import media_library
 
 STATIC = Path(__file__).parent / "static"
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
@@ -39,8 +42,9 @@ async def lifespan(app):
     worker.stop()
 
 
-app = FastAPI(title="ShopDock 本地多店工作台", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="ShopDock 本地多店工作台", version="0.3.7", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1,[::1],testserver").split(","))
+app.include_router(publishing_router)
 
 
 @app.middleware("http")
@@ -49,7 +53,7 @@ async def security_headers(request, call_next):
         origin = request.headers.get("origin")
         if origin and urlsplit(origin).netloc != request.headers.get("host"):
             return JSONResponse({"detail": "拒绝跨站请求"}, status_code=403)
-        limit = MAX_UPLOAD + 1024 * 1024 if request.url.path == "/api/media" else 5 * 1024 * 1024
+        limit = MAX_UPLOAD + 1024 * 1024 if request.url.path in ("/api/media", "/api/media/import") else 5 * 1024 * 1024
         length = request.headers.get("content-length")
         if length is None and request.method != "DELETE":
             return JSONResponse({"detail": "上传请求须提供 Content-Length"}, status_code=411)
@@ -65,12 +69,17 @@ async def security_headers(request, call_next):
     response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'"
     if request.url.path.startswith("/api/") or request.url.path.startswith("/desktop/"):
         response.headers["Cache-Control"] = "no-store"
+    elif request.url.path == "/" or request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
 @app.exception_handler(Blocked)
 async def blocked(request, exc):
     return JSONResponse({"detail": str(exc)}, status_code=409)
+
+
+app.include_router(media_library.router)
 
 
 def must_store(store_id, secrets=False):
@@ -89,7 +98,7 @@ def must_product(product_id):
 
 @app.get("/healthz")
 def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.3.7"}
 
 
 @app.get("/api/auth/status")
@@ -157,11 +166,11 @@ def state():
     issues = db.one("SELECT count(*) n FROM jobs WHERE status IN ('blocked','failed','uncertain')")["n"]
     orders = db.one("SELECT count(*) n FROM orders")["n"]
     return {"stores": stores, "products": products, "listings": [inventory.listing(r) for r in db.all_rows("SELECT * FROM listings")],
-            "media": db.all_rows("SELECT id,name,kind,mime,size,created FROM media ORDER BY created DESC LIMIT 1000"),
+            "media": media_library.state_rows(),
             "stats": {"products": db.one("SELECT count(*) n FROM products")["n"], "orders": orders, "pending": pending, "issues": issues},
             "platforms": PLATFORMS, "engine_ready": mpau_available(), "desktop_ready": Path("/opt/novnc/vnc.html").exists(),
             "commerce_browser_ready": commerce_browser_available(),
-            "max_upload_mb": MAX_UPLOAD // (1024 * 1024), "version": "0.3.0"}
+            "max_upload_mb": MAX_UPLOAD // (1024 * 1024), "version": "0.3.7"}
 
 
 @app.post("/api/stores", dependencies=[Depends(require_user)])
@@ -194,12 +203,37 @@ def account(sid: str, action: str):
     return jobs.account_job(store, "account_" + action)
 
 
+@app.post("/api/stores/{sid}/commerce/prepare-product", dependencies=[Depends(require_user)])
+def prepare_commerce_product(sid: str, body: CommercePrepareInput):
+    store, product = must_store(sid), must_product(body.product_id)
+    business = body.business.model_dump(exclude_unset=True) if body.business is not None else None
+    return jobs.prepare_product_job(store, product, body.upload_images, business)
+
+
 @app.post("/api/stores/{sid}/commerce/{action}", dependencies=[Depends(require_user)])
 def commerce_account(sid: str, action: str):
     store = must_store(sid)
     if action not in ("login", "check", "logout"):
         raise HTTPException(404, "未知电商账号操作")
     return jobs.commerce_account_job(store, "commerce_" + action)
+
+
+@app.post("/api/stores/{sid}/commerce/login/confirm", dependencies=[Depends(require_user)])
+def commerce_login_confirm(sid: str):
+    must_store(sid)
+    active = db.one("SELECT id,status FROM jobs WHERE store_id=? AND kind='commerce_login' "
+                    "AND status='running' ORDER BY created DESC LIMIT 1", (sid,))
+    if not active:
+        raise HTTPException(409, "登录浏览器尚未启动或登录任务已结束；请等待页面打开并完成扫码")
+    from .commerce_browser import confirm_login
+    confirm_login(sid)
+    return {"ok": True, "job_id": active["id"],
+            "message": "已请求结束登录任务；浏览器核对页面后会自动关闭"}
+
+
+@app.get("/api/stores/{sid}/commerce/readiness", dependencies=[Depends(require_user)])
+def commerce_readiness(sid: str):
+    return describe_commerce_readiness(must_store(sid))
 
 
 @app.post("/api/stores/{sid}/verify", dependencies=[Depends(require_user)])
@@ -220,16 +254,12 @@ def verify(sid: str, body: Resolve):
 
 def save_product(body, pid=None, connection=None):
     data = body.model_dump(exclude={"version"})
-    if body.cover_id and not db.one("SELECT id FROM media WHERE id=? AND kind='image'", (body.cover_id,)):
-        raise HTTPException(422, "主图不存在")
-    for mid in set(body.image_ids + body.detail_image_ids):
-        if not db.one("SELECT id FROM media WHERE id=? AND kind='image'", (mid,)):
-            raise HTTPException(422, '商品图片不存在')
     if pid:
         if body.version is None:
             raise HTTPException(422, "编辑商品须提供 version，以避免覆盖其他修改")
         with db.connection() as c:
             c.execute('BEGIN IMMEDIATE')
+            media_library.validate_product_media(c, data)
             inventory.validate_stock(c, pid, data)
             old = c.execute('SELECT data FROM products WHERE id=?', (pid,)).fetchone()
             if old:
@@ -244,6 +274,8 @@ def save_product(body, pid=None, connection=None):
     else:
         pid = db.uid()
         with db.connection() as c:
+            c.execute('BEGIN IMMEDIATE')
+            media_library.validate_product_media(c, data)
             c.execute("INSERT INTO products(id,data,created,updated) VALUES(?,?,?,?)", (pid, db.dumps(data), db.now(), db.now()))
     return db.get_product(pid)
 
@@ -370,47 +402,20 @@ def check_ks_video(jid: str):
 
 
 @app.post("/api/media", dependencies=[Depends(require_user)])
-async def upload(file: UploadFile = File(...)):
-    ext = Path(file.filename or "").suffix.lower()
-    types = {".jpg": ("image", "image/jpeg"), ".jpeg": ("image", "image/jpeg"), ".png": ("image", "image/png"), ".webp": ("image", "image/webp"), ".mp4": ("video", "video/mp4"), ".mov": ("video", "video/quicktime"), ".webm": ("video", "video/webm")}
-    if ext not in types:
-        raise HTTPException(422, "只支持 JPG、PNG、WebP、MP4、MOV、WebM")
-    mid, total, digest = db.uid(), 0, hashlib.sha256()
-    relative = "media/" + mid + ext
-    path = db.DATA / relative
-    try:
-        with path.open("xb") as out:
-            first = True
-            while chunk := await file.read(1024 * 1024):
-                if first:
-                    valid = (ext in (".jpg", ".jpeg") and chunk[:3] == b"\xff\xd8\xff") or (ext == ".png" and chunk[:8] == b"\x89PNG\r\n\x1a\n") or (ext == ".webp" and chunk[:4] == b"RIFF" and chunk[8:12] == b"WEBP") or (ext in (".mp4", ".mov") and chunk[4:8] in (b"ftyp", b"moov", b"wide", b"mdat")) or (ext == ".webm" and chunk[:4] == b"\x1aE\xdf\xa3")
-                    if not valid:
-                        raise HTTPException(422, "文件内容与扩展名不匹配")
-                    first = False
-                total += len(chunk)
-                if total > MAX_UPLOAD:
-                    raise HTTPException(413, "文件超过上传上限")
-                digest.update(chunk)
-                out.write(chunk)
-        if not total:
-            raise HTTPException(422, "不能上传空文件")
-        kind, mime = types[ext]
-        with db.connection() as c:
-            c.execute("INSERT INTO media VALUES(?,?,?,?,?,?,?,?)", (mid, Path(file.filename).name[:240], kind, mime, relative, total, digest.hexdigest(), db.now()))
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    finally:
-        await file.close()
-    return {"id": mid, "name": Path(file.filename).name, "kind": kind, "size": total}
+async def upload(file: UploadFile = File(...), category: str = Form(''),
+                 tags: str = Form('[]'), relative_path: str = Form('')):
+    return await media_library.store_upload(file, category, tags, relative_path, max_bytes=MAX_UPLOAD)
 
 
 @app.get("/api/media/{mid}", dependencies=[Depends(require_user)])
 def get_media(mid: str):
     media = db.one("SELECT * FROM media WHERE id=?", (mid,))
-    if not media or not (db.DATA / media["path"]).exists():
+    if not media:
         raise HTTPException(404, "素材不存在")
-    return FileResponse(db.DATA / media["path"], media_type=media["mime"], filename=media["name"], content_disposition_type="inline")
+    path = media_library.media_path(media['path'])
+    if not path.is_file():
+        raise HTTPException(404, "素材不存在")
+    return FileResponse(path, media_type=media["mime"], filename=media["name"], content_disposition_type="inline")
 
 
 @app.get("/api/orders", dependencies=[Depends(require_user)])
@@ -591,6 +596,44 @@ def job_log(jid: str):
     with path.open("rb") as f:
         f.seek(max(0, path.stat().st_size - 24000))
         return {"text": redact(f.read().decode("utf-8", "replace"))}
+
+
+@app.get('/api/jobs/{jid}/preview', dependencies=[Depends(require_user)])
+def commerce_preview(jid: str):
+    job = db.one('SELECT kind,status,result FROM jobs WHERE id=?', (jid,))
+    if not job or job['kind'] != 'commerce_prepare_product':
+        raise HTTPException(404, '填表预览任务不存在')
+    from .commerce_preview import read_marker
+    try:
+        result = json.loads(job['result'])
+    except (ValueError, TypeError):
+        result = {}
+    message = result.get('message', '') if isinstance(result, dict) else ''
+    message = redact(message) if isinstance(message, str) else ''
+    try:
+        return read_marker(db.DATA, jid, job['status'] in ('queued', 'running'),
+                           job_status=job['status'], job_message=message)
+    except (ValueError, OSError):
+        raise HTTPException(409, '预览记录不可用，请查看任务状态或重新打开预览') from None
+
+
+@app.post('/api/jobs/{jid}/preview/close', dependencies=[Depends(require_user)])
+def close_commerce_preview(jid: str):
+    with db.connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        job = conn.execute('SELECT kind,status FROM jobs WHERE id=?', (jid,)).fetchone()
+        if not job or job['kind'] != 'commerce_prepare_product':
+            raise HTTPException(404, '填表预览任务不存在')
+        if job['status'] == 'queued':
+            conn.execute("UPDATE jobs SET status='cancelled',result=?,updated=? WHERE id=?",
+                         (db.dumps({'message': '填表预览已取消，尚未打开商家表单'}), db.now(), jid))
+    from .commerce_preview import request_close
+    try:
+        request_close(db.DATA, jid)
+    except (ValueError, OSError):
+        raise HTTPException(409, '无法结束此预览，请在扫码窗口关闭本次浏览器') from None
+    db.audit('结束快手填表预览', {'job_id': jid})
+    return {'ok': True, 'closing': True}
 
 
 @app.post("/api/jobs/{jid}/action", dependencies=[Depends(require_user)])

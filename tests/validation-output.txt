@@ -1,22 +1,28 @@
-ShopDock Local v0.3.0 — 2026-11-02
+ShopDock v0.3.7 / 2026-11-03
 
-Docker isolated full-suite, network disabled, temporary APP_DATA:
-entrypoint=/opt/mpau-venv/bin/python
-PYTHONPATH=/work/.testdeps:/work:/usr/local/lib/python3.12/site-packages
-python -m pytest tests -q -p no:cacheprovider
-136 passed, 1 warning in 27.66s
-Warning: existing FastAPI/Starlette httpx deprecation.
-Playwright: 1.64.1
-Browser tests: actual Chrome with local mock HTML; no merchant writes.
+Full isolated backend/browser regression:
+301 passed, 1 warning in 125.74s (0:02:05)
+Warning: existing Starlette TestClient httpx deprecation.
+No skipped tests. Merchant HTML provided locally; Docker network disabled.
 
-node --check app/static/app.js
-exit 0
-node --test tests/test_ui.cjs
-3 tests, 3 pass, 0 fail, 0 skipped
+Frontend jsdom: 30 tests, 30 passed, 0 failed.
+JavaScript syntax: app.js, library.js, publishing.js passed.
+Docker Compose configuration and v0.3.7 image build passed.
+Post-deployment cache fix: API regression 25 passed in 6.20s,
+including the new HTML and versioned-asset cache test.
 
-Docker compose config --quiet (full/core): exit 0
-Actual Edge UI inspection on temporary 127.0.0.1:8081: passed, no console errors.
-Temporary UI container removed. Existing 8080 service untouched.
+Real Edge acceptance in an independent ephemeral instance:
+- Local administrator setup.
+- New-product dialog renders the empty media chooser without a null crash.
+- Local product creation and save.
+- Media-library navigation and filters.
 
-Not verified: real merchant DOM rules, actual accounts, actual product/inventory/order operations,
-real video publish, full Docker image rebuild.
+Live localhost:8080 acceptance after backup and deployment:
+- Version 0.3.7; original product and store retained.
+- Versioned assets resolve the previously cached old scripts.
+- Product thumbnail loaded; hover displays the 260x260 zoom panel.
+- Unified publishing menu and record list render successfully.
+
+Not verified: complete live merchant create/update/qualification/category/SKU,
+platform image review, real score/receipt and audit flows across six platforms.
+No real product was submitted by this validation.

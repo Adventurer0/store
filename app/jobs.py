@@ -5,6 +5,7 @@ except ImportError:  # Windows has no fcntl; fall back to the bundled shim.
 import hashlib
 import json
 import threading
+import time
 import traceback
 from . import db, inventory
 from .ks_video import KuaishouVideo
@@ -102,10 +103,15 @@ def enqueue(plan, account_group=()):
         for item in plan:
             if account_group:
                 marks = ','.join('?' for _ in account_group)
-                active = c.execute(f"SELECT id,kind,status FROM jobs WHERE store_id=? AND kind IN ({marks}) AND status IN ('queued','running') LIMIT 1", (item['store_id'], *account_group)).fetchone()
+                active = c.execute(f"SELECT id,kind,status,entity_id,payload FROM jobs WHERE store_id=? AND kind IN ({marks}) AND status IN ('queued','running') LIMIT 1", (item['store_id'], *account_group)).fetchone()
                 if active:
                     if active['kind'] != item['kind']:
-                        raise Blocked('当前账号任务正在排队或执行，请等待完成后再发起其他登录操作')
+                        raise Blocked('此店铺正在执行「%s」，请等待完成后再发起其他登录操作' %
+                                      {'commerce_login': '登录电商后台', 'commerce_check': '检查电商登录',
+                                       'commerce_logout': '清除电商登录',
+                                       'commerce_prepare_product': '快手填表预览'}.get(active['kind'], active['kind']))
+                    if item['kind'] == 'commerce_prepare_product' and (active['entity_id'] != item.get('entity_id', '') or json.loads(active['payload']) != item['payload']):
+                        raise Blocked('此店铺已有其他填表预览正在排队或执行，请先结束该预览')
                     output.append({'id': active['id'], 'status': active['status'], 'duplicate': True})
                     continue
             previous = c.execute("SELECT id,status FROM jobs WHERE dedupe_key=?", (item["dedupe_key"],)).fetchone()
@@ -147,15 +153,46 @@ def commerce_account_job(store, action):
         raise Blocked('请先启用此店铺的网页电商管理')
     if action != 'commerce_logout' and not commerce_available():
         raise Blocked('网页电商浏览器未安装；请使用 Docker 完整镜像')
-    return enqueue([{'kind': action, 'store_id': store['id'], 'payload': {}, 'scheduled': db.now(), 'dedupe_key': db.uid()}], account_group=('commerce_login', 'commerce_check', 'commerce_logout'))
+    return enqueue([{'kind': action, 'store_id': store['id'], 'payload': {}, 'scheduled': db.now(), 'dedupe_key': db.uid()}], account_group=('commerce_login', 'commerce_check', 'commerce_logout', 'commerce_prepare_product'))
+
+
+def prepare_product_job(store, product, upload_images=False, business=None):
+    from .commerce_browser import prepare_payload
+    current = inventory.listing(db.one('SELECT * FROM listings WHERE product_id=? AND store_id=?', (product['id'], store['id'])))
+    request = prepare_payload(store, product, current, upload_images, business)
+    payload = {'product_id': product['id'], 'product_version': product['version'],
+               'request': request, 'identity': store['templates'].get('commerce_browser', {}).get('identity')}
+    return enqueue([{'kind': 'commerce_prepare_product', 'store_id': store['id'],
+                     'entity_id': product['id'], 'payload': payload,
+                     'scheduled': db.now(), 'dedupe_key': db.uid()}],
+                   account_group=('commerce_login', 'commerce_check', 'commerce_logout', 'commerce_prepare_product'))
 
 
 def execute(job):
+    if job['kind'].startswith('workbench_'):
+        from .publish_workbench import execute as execute_workbench
+        return execute_workbench(job)
     store = db.get_store(job["store_id"], secrets=True)
     payload = json.loads(job["payload"])
     kind = job["kind"]
     if not store:
         raise Blocked('店铺不存在')
+    if kind == 'commerce_prepare_product':
+        from .commerce_browser import prepare_payload
+        product = db.get_product(payload['product_id'])
+        if not product or product['version'] != payload['product_version']:
+            raise Blocked('预览排队后商品资料已变化，请重新打开填表预览')
+        identity = store['templates'].get('commerce_browser', {}).get('identity')
+        if identity != payload['identity']:
+            raise Blocked('预览排队后店铺身份绑定已变化，请重新打开填表预览')
+        current = inventory.listing(db.one('SELECT * FROM listings WHERE product_id=? AND store_id=?', (product['id'], store['id'])))
+        reviewed = payload['request']
+        request = prepare_payload(store, product, current, reviewed['upload_images'],
+                                  reviewed['publish_config']['kuaishou_preview'])
+        if request != reviewed:
+            raise Blocked('预览排队后商品关联或业务资料已变化，请重新打开填表预览')
+        result = CommerceBrowser(store).prepare_product(request, job_id=job['id'])
+        return 'succeeded', result
     if kind.startswith('commerce_'):
         action = kind.removeprefix('commerce_')
         if action not in ('login', 'check', 'logout'):
@@ -271,6 +308,7 @@ class Worker:
         self.stop_event = threading.Event()
         self.thread = None
         self.lock_file = None
+        self.last_reap = 0.0
 
     def start(self):
         self.lock_file = (db.DATA / "worker.lock").open("a")
@@ -282,6 +320,26 @@ class Worker:
             c.execute("UPDATE jobs SET status='uncertain',result=?,updated=? WHERE status='running'", (db.dumps({"message": "上次执行被中断，结果未知；请先核对平台后台"}), db.now()))
         self.thread = threading.Thread(target=self.loop, daemon=True, name="shopdock-worker")
         self.thread.start()
+
+    def reap_stale(self):
+        """Free a stuck account lock after a fixed wall-clock bound.
+
+        A killed Chrome or a wedged SPA can leave a job 'running' forever, which
+        used to block every later login for that store. Running jobs are bounded
+        here; the worker still overwrites the row when it returns.
+        """
+        now = int(time.time())
+        limits = (('commerce_login', 420), ('account_login', 900),
+                  ('commerce_prepare_product', 900))
+        for kind, seconds in limits:
+            with db.connection() as c:
+                c.execute("UPDATE jobs SET status='uncertain',result=?,updated=? "
+                          "WHERE kind=? AND status='running' AND updated<?",
+                          (db.dumps({'message': '任务执行超时或窗口已关闭，结果未知；请重新发起'}), now, kind, now - seconds))
+        with db.connection() as c:
+            c.execute("UPDATE jobs SET status='uncertain',result=?,updated=? "
+                      "WHERE status='running' AND updated<? AND kind NOT IN ('commerce_login','account_login','commerce_prepare_product')",
+                      (db.dumps({'message': '任务执行超时，结果未知；请核对平台后台后重新发起'}), now, now - 1200))
 
     def claim(self):
         with db.connection() as c:
@@ -312,6 +370,9 @@ class Worker:
     def loop(self):
         while not self.stop_event.is_set():
             try:
+                if time.time() - self.last_reap > 10:
+                    self.reap_stale()
+                    self.last_reap = time.time()
                 self.schedule_order_sync()
                 job = self.claim()
                 if job:
@@ -325,6 +386,12 @@ class Worker:
         for row in db.all_rows("SELECT id FROM stores WHERE commerce_enabled=1 AND commerce_status='valid'"):
             store = db.get_store(row['id'])
             if not store['templates'].get('auto_order_sync'):
+                continue
+            try:
+                validate_workflow(store, 'orders')
+            except Blocked:
+                # Do not enqueue a blocked order-sync task every minute; the
+                # readiness page already reports the missing adapter.
                 continue
             key = 'orders_poll_' + store['id']
             last = db.one('SELECT value FROM settings WHERE key=?', (key,))

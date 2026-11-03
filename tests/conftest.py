@@ -33,7 +33,7 @@ def store(owner):
 
 @pytest.fixture
 def product(owner):
-    r = owner.post("/api/products", json={"title": "银色骑行箱测试商品", "skus": [{"code": "BOX-SILVER", "name": "银色", "price_cents": 129900, "stock": 10}]})
+    r = owner.post("/api/products", json={"title": "银色骑行箱测试商品", "description": "用于测试的银色骑行箱，带密码锁、万向轮和可拆卸内袋。", "category": "箱包", "skus": [{"code": "BOX-SILVER", "name": "银色", "price_cents": 129900, "stock": 10}]})
     assert r.status_code == 200, r.text
     return r.json()
 

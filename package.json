@@ -1,1 +1,1 @@
-{"name":"shopdock-local","private":true,"version":"0.3.0","scripts":{"dev":"bash scripts/dev.sh","check":"node --check app/static/app.js","test:ui":"node --test tests/test_ui.cjs"},"devDependencies":{"jsdom":"26.1.0"}}
+{"name":"shopdock-local","private":true,"version":"0.3.7","scripts":{"dev":"bash scripts/dev.sh","check":"node --check app/static/app.js && node --check app/static/library.js && node --check app/static/publishing.js","test:ui":"node --test tests/test_ui.cjs tests/test_library_ui.cjs tests/test_publishing_ui.cjs"},"devDependencies":{"jsdom":"26.1.0"}}
